@@ -87,10 +87,10 @@ void *wait_remote_completions_thread(void *arg) {
   do {
     rc = pfi_get_revent(TEST_ANY_SOURCE, 1, &ids, &imms, &n);
     if (rc == TEST_EVENT_ERROR) {
-      err(1, "Get event error");
+      err(1, "Get revent error");
     }
     if (n) {
-      err(1, "Got a remote event!");
+      err(1, "Not expecting a remote event!");
     }
   } while (!DONE);
   
