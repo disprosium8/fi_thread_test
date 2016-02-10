@@ -30,36 +30,50 @@ static void dbg_wait(void) {
     sleep(12);
 }
 
-#if defined(linux)
-#define HAVE_SETAFFINITY
-#include <sched.h>
-#endif
+#define NALLOC           8192
+#define ALLOC_SIZE       (1024*1024*2)
 
-#ifndef CPU_SETSIZE
-#undef HAVE_SETAFFINITY
-#endif
+#define NRBUFS           8
 
 #define BUF_SIZE         (1024*1024*1)
 #define TAG              UINT32_MAX
-#define SQ_SIZE          1000
+#define SQ_SIZE          100
 
 #define LARGE_LIMIT      16384
 #define LARGE_ITERS      1000
 
-static int ITERS       = 10000;
+static int ITERS       = 100000;
+static char *sbuf, *rbuf;
 
 static int DONE = 0;
 static int myrank;
 static int nranks;
+static int next;
 static int rthreads = 1;
+static int athreads = 1;
 
+static void *ctx;
 static sem_t sem;
 
-#ifdef HAVE_SETAFFINITY
-static int ncores = 1;
-static cpu_set_t cpu_set;
-static cpu_set_t def_set;
-#endif
+static test_buf_t lbuf, rbufs[NRBUFS], *rds;
+
+void *alloc_thread() {
+  test_buf_t bufs[NALLOC];
+  int i = 0;
+  do {
+    bufs[i].addr = (uintptr_t)calloc(1, ALLOC_SIZE);
+    bufs[i].size = ALLOC_SIZE;
+    pfi_buffer_register(&bufs[i], ctx, 0);    
+    if (i >= NALLOC/2) {
+      pfi_buffer_unregister(&bufs[i-NALLOC/2], ctx);
+      free((void*)bufs[i-NALLOC/2].addr);
+    }
+    i = (++i) % NALLOC;
+    usleep(1000);
+  } while(!DONE);
+
+  pthread_exit(NULL);
+}
 
 void *wait_local_completion_thread(void *arg) {
   uint64_t ids;
@@ -100,10 +114,8 @@ void *wait_remote_completions_thread(void *arg) {
 int main(int argc, char **argv) {
   long t;
   int i, j, k, val;
-  int rank, nproc, iters, next;
-  int aff_main, aff_evq, aff_ledg;
-  pthread_t th, recv_threads[rthreads];
-  test_buf_t lbuf, rbuf, *rds;
+  int rank, nproc, iters;
+  pthread_t th, recv_threads[rthreads], th2[athreads];
   
   MPI_Init(&argc,&argv);
 
@@ -114,7 +126,7 @@ int main(int argc, char **argv) {
   nranks = nproc;
   next = (myrank+1) % nranks;
   
-  void *ctx = pfi_init(rank, nproc);
+  ctx = pfi_init(rank, nproc);
   if (!ctx) {
     err(1, "Could not initialize libfabric");
   }
@@ -122,73 +134,38 @@ int main(int argc, char **argv) {
   if (rthreads == 0)
     rthreads = nproc;
   
-  aff_main = aff_evq = aff_ledg = -1;
-  if (argc > 1)
-    aff_main = atoi(argv[1]);
-  if (argc > 2)
-    aff_evq = atoi(argv[2]);
-  if (argc > 3)
-    aff_ledg = atoi(argv[3]);
-
   lbuf.addr = (uintptr_t)malloc(BUF_SIZE);
   lbuf.size = BUF_SIZE;
   pfi_buffer_register(&lbuf, ctx, 0);
   
-  rbuf.addr = (uintptr_t)malloc(BUF_SIZE);
-  rbuf.size = BUF_SIZE;
-  pfi_buffer_register(&rbuf, ctx, 0);
+  for (i=0; i<NRBUFS; i++) {
+    rbufs[i].addr = (uintptr_t)malloc(BUF_SIZE);
+    rbufs[i].size = BUF_SIZE;
+    pfi_buffer_register(&rbufs[i], ctx, 0);
+  }
 
-  rds = malloc(sizeof(rbuf)*nranks);
-  MPI_Allgather(&rbuf, sizeof(rbuf), MPI_BYTE, rds, sizeof(rbuf), MPI_BYTE, MPI_COMM_WORLD);
+  rds = malloc(sizeof(rbufs)*nranks);
+  MPI_Allgather(&rbufs, sizeof(rbufs), MPI_BYTE, rds, sizeof(rbufs), MPI_BYTE, MPI_COMM_WORLD);
 
   sem_init(&sem, 0, SQ_SIZE);
 
-  // Create a thread to wait for local completions 
+  // Create a thread to wait for local completions
   pthread_create(&th, NULL, wait_local_completion_thread, NULL);
 
   for (t=0; t<rthreads; t++) {
     pthread_create(&recv_threads[t], NULL, wait_remote_completions_thread, (void*)t);
   }
   
-  // set affinity as requested
-#ifdef HAVE_SETAFFINITY
-  if ((ncores = sysconf(_SC_NPROCESSORS_CONF)) <= 0)
-    err(1, "sysconf: couldn't get _SC_NPROCESSORS_CONF");
-  CPU_ZERO(&def_set);
-  for (i=0; i<ncores; i++)
-    CPU_SET(i, &def_set);
-  if (aff_main >= 0) {
-    CPU_ZERO(&cpu_set);
-    CPU_SET(aff_main, &cpu_set);
-    if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpu_set) != 0)
-      err(1, "couldn't change CPU affinity");
+  // Create some threads that aggressively allocate and register memory
+  for (t=0; t<athreads; t++) {
+    pthread_create(&th2[t], NULL, alloc_thread, NULL);
   }
-  else
-    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &def_set);
-  if (aff_evq >= 0) {
-    CPU_ZERO(&cpu_set);
-    CPU_SET(aff_evq, &cpu_set);
-    pthread_setaffinity_np(th, sizeof(cpu_set_t), &cpu_set);
-  }
-  else
-    pthread_setaffinity_np(th, sizeof(cpu_set_t), &def_set);
-  if (aff_evq >= 0) {
-    CPU_ZERO(&cpu_set);
-    CPU_SET(aff_ledg, &cpu_set);
-    for (i=0; i<rthreads; i++)
-      pthread_setaffinity_np(recv_threads[i], sizeof(cpu_set_t), &cpu_set);
-  }
-  else {
-    for (i=0; i<rthreads; i++)
-      pthread_setaffinity_np(recv_threads[i], sizeof(cpu_set_t), &def_set);
-  }
-#endif
 
   if (myrank == 0)
     printf("%-7s%-9s%-12s%-12s%-12s\n", "Ranks", "Senders", "Bytes", "Sync GET");
   
   struct timespec time_s, time_e;
-  for (int ns = 0; ns < nranks; ns++) {
+  for (int ns = 1; ns < nranks; ns++) {
     
     for (i=1; i<=BUF_SIZE; i+=i) {
       
@@ -209,8 +186,9 @@ int main(int argc, char **argv) {
 	    do {
 	      c = pfi_tx_size_left(next);
 	    } while (!c);
-	    pfi_rdma_get(next, lbuf.addr, rds[next].addr, i, lbuf.priv_ptr, rds[next].keys.key0, TAG, 0);
-	    //pfi_rdma_put(next, lbuf.addr, rds[next].addr, i, lbuf.priv_ptr, rds[next].keys.key0, TAG, 0, 0);
+	    int n = next * NRBUFS + k % NRBUFS;
+	    pfi_rdma_get(next, lbuf.addr, rds[n].addr, i, lbuf.priv_ptr, rds[n].keys.key0, TAG, 0);
+	    //pfi_rdma_put(next, lbuf.addr, rds[n].addr, i, lbuf.priv_ptr, rds[n].keys.key0, TAG, 0, 0);
 	  }
 	}
       }
@@ -245,8 +223,11 @@ int main(int argc, char **argv) {
 
   pfi_buffer_unregister(&lbuf, ctx);
   free((void*)lbuf.addr);
-  pfi_buffer_unregister(&rbuf, ctx);
-  free((void*)rbuf.addr);
+
+  for (i=0; i<NRBUFS; i++) {
+    pfi_buffer_unregister(&rbufs[i], ctx);
+    free((void*)rbufs[i].addr);
+  }
   
   pfi_finalize();
   
