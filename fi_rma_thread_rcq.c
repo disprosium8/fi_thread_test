@@ -115,7 +115,8 @@ void *wait_remote_completions_thread(void *arg) {
     if (n && (imms>>56<<56 == SYNC_CHK)) {
       uint32_t size = (imms & ~(SYNC_CHK))>>32;
       uint32_t iter = imms<<32>>32;
-      uint64_t *v = (uint64_t*)(rbufs[NRBUFS].addr + sizeof(uint64_t) * iter);
+      int n = iter % NRBUFS;
+      uint8_t *v = (uint8_t*)(rbufs[n].addr + size * iter);
       assert(*v == TVAL);
     }
     else if (n && (imms>>32<<32 == SYNC_REQ)) {
@@ -128,7 +129,7 @@ void *wait_remote_completions_thread(void *arg) {
       int src = imms<<32>>32;
       assert(src != myrank);
       int n = src * (NRBUFS+1) + NRBUFS;
-      pfi_rdma_put(src, lbuf.addr, rds[n].addr, 8, lbuf.priv_ptr, rds[n].keys.key0,
+      pfi_rdma_put(src, lbuf.addr, rds[n].addr, sizeof(uint64_t), lbuf.priv_ptr, rds[n].keys.key0,
 		   TAG+1, SYNC_REP | myrank, TEST_FLAG_WITH_IMM);
     }
     else if (n && (imms>>32<<32 & SYNC_REP)) {
@@ -218,7 +219,7 @@ int main(int argc, char **argv) {
 	    int c;
 	    do {
 	      c = pfi_tx_size_left(next);
-	    } while (c<2);
+	    } while (!c);
 	    
 	    // get a remote buffer to write to
 	    int n = next * (NRBUFS+1) + k % NRBUFS;
@@ -226,18 +227,21 @@ int main(int argc, char **argv) {
 	    uintptr_t raddr = rds[n].addr + i * k;
 	    // encode some immediate data so we know where to look on the target
 	    uint64_t imm = SYNC_CHK | (uint64_t)i<<32 | k;
-	    
+	    // send a specific value in the first byte
+	    uint8_t *v = (uint8_t*)lbuf.addr;
+	    *v = TVAL;
+
 	    // first part put
 	    pfi_rdma_put(next, lbuf.addr, raddr, i, lbuf.priv_ptr, rds[n].keys.key0,
-			 TAG, 0xfacefeed, TEST_FLAG_WITH_IMM);
+			 TAG, imm, TEST_FLAG_WITH_IMM);
 	    
 	    // now put to our reserved buffer
-	    n = next * (NRBUFS+1) + NRBUFS;
-	    raddr = rds[n].addr + sizeof(uint64_t) * k;
-	    uint64_t *v = (uint64_t*)lbuf.addr;
-	    *v = TVAL;
-	    pfi_rdma_put(next, lbuf.addr, raddr, sizeof(uint64_t), lbuf.priv_ptr, rds[n].keys.key0,
-			 TAG, imm, TEST_FLAG_WITH_IMM);
+	    // n = next * (NRBUFS+1) + NRBUFS;
+	    // raddr = rds[n].addr + sizeof(uint64_t) * k;
+	    // uint64_t *v = (uint64_t*)lbuf.addr;
+	    // *v = TVAL;
+	    // pfi_rdma_put(next, lbuf.addr, raddr, sizeof(uint64_t), lbuf.priv_ptr, rds[n].keys.key0,
+	    // 		 TAG, imm, TEST_FLAG_WITH_IMM);
 	  }
 	}
       }
