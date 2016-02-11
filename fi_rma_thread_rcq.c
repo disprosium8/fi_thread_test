@@ -55,7 +55,6 @@ static int myrank;
 static int nranks;
 static int next;
 static int rthreads = 1;
-static int athreads = 0;
 
 static void *ctx;
 static sem_t sem, rsem;
@@ -65,13 +64,15 @@ test_buf_t lbuf, rbufs[NRBUFS+1], *rds;
 int do_sync() {
   int i, val;
   for (i=0; i<nranks; i++) {
-    if (i==myrank) continue;
     sem_wait(&rsem);
+    if (i==myrank) continue;
     int n = i * (NRBUFS+1) + NRBUFS;
     pfi_rdma_put(i, lbuf.addr, rds[n].addr, 8, lbuf.priv_ptr, rds[n].keys.key0,
-		 TAG+1, SYNC_REQ | i, TEST_FLAG_WITH_IMM);
+		 TAG+1, SYNC_REQ | myrank, TEST_FLAG_WITH_IMM);
   }
   
+  // we wait for our own buffer to get cleared
+  // and for the replies from peers
   do {
     if (sem_getvalue(&rsem, &val)) continue;
   } while (val < nranks);
@@ -114,21 +115,28 @@ void *wait_remote_completions_thread(void *arg) {
     if (n && (imms>>56<<56 == SYNC_CHK)) {
       uint32_t size = (imms & ~(SYNC_CHK))>>32;
       uint32_t iter = imms<<32>>32;
-      int n = iter % NRBUFS;
-      uint8_t *v = (uint8_t*)rbufs[n].addr + size * iter;
+      uint64_t *v = (uint64_t*)(rbufs[NRBUFS].addr + sizeof(uint64_t) * iter);
       assert(*v == TVAL);
     }
     else if (n && (imms>>32<<32 == SYNC_REQ)) {
-      for (i=0; i<NRBUFS; i++) {
+      for (i=0; i<NRBUFS+1; i++) {
 	memset((void*)rbufs[i].addr, 0, sizeof(BUF_SIZE));
       }
+      // signal that we cleared our local buffers
+      sem_post(&rsem);
+      
       int src = imms<<32>>32;
+      assert(src != myrank);
       int n = src * (NRBUFS+1) + NRBUFS;
       pfi_rdma_put(src, lbuf.addr, rds[n].addr, 8, lbuf.priv_ptr, rds[n].keys.key0,
 		   TAG+1, SYNC_REP | myrank, TEST_FLAG_WITH_IMM);
     }
-    else if (n && (imms>>32<<32 & SYNC_REQ)) {
+    else if (n && (imms>>32<<32 & SYNC_REP)) {
+      // signal that we got a peer reply
       sem_post(&rsem);
+    }
+    else if (n && (imms == 0xfacefeed)) {
+      // data put
     }
     else if (n) {
       err(1, "Got unexpected immediate data: 0x%016lx", imms);
@@ -142,7 +150,7 @@ int main(int argc, char **argv) {
   long t;
   int i, j, k, val;
   int rank, nproc, iters;
-  pthread_t th, recv_threads[rthreads], th2[athreads];
+  pthread_t th, recv_threads[rthreads];
   
   MPI_Init(&argc,&argv);
 
@@ -185,7 +193,7 @@ int main(int argc, char **argv) {
   }
   
   if (myrank == 0)
-    printf("%-7s%-9s%-12s%-12s%-12s\n", "Ranks", "Senders", "Bytes", "Sync GET");
+    printf("%-7s%-9s%-12s%-12s\n", "Ranks", "Senders", "Bytes", "Sync PUT");
   
   struct timespec time_s, time_e;
   for (int ns = 0; ns < nranks; ns++) {
@@ -210,22 +218,25 @@ int main(int argc, char **argv) {
 	    int c;
 	    do {
 	      c = pfi_tx_size_left(next);
-	    } while (!c);
+	    } while (c<2);
 	    
 	    // get a remote buffer to write to
 	    int n = next * (NRBUFS+1) + k % NRBUFS;
-	    
 	    // compute the offset in the remote buffer for this iter
 	    uintptr_t raddr = rds[n].addr + i * k;
-
 	    // encode some immediate data so we know where to look on the target
 	    uint64_t imm = SYNC_CHK | (uint64_t)i<<32 | k;
 	    
-	    // send a particular value
-	    uint8_t *v = (uint8_t*)lbuf.addr;
-	    *v = TVAL;
-	    
+	    // first part put
 	    pfi_rdma_put(next, lbuf.addr, raddr, i, lbuf.priv_ptr, rds[n].keys.key0,
+			 TAG, 0xfacefeed, TEST_FLAG_WITH_IMM);
+	    
+	    // now put to our reserved buffer
+	    n = next * (NRBUFS+1) + NRBUFS;
+	    raddr = rds[n].addr + sizeof(uint64_t) * k;
+	    uint64_t *v = (uint64_t*)lbuf.addr;
+	    *v = TVAL;
+	    pfi_rdma_put(next, lbuf.addr, raddr, sizeof(uint64_t), lbuf.priv_ptr, rds[n].keys.key0,
 			 TAG, imm, TEST_FLAG_WITH_IMM);
 	  }
 	}
@@ -246,7 +257,7 @@ int main(int argc, char **argv) {
       }
       
       // make sure remote completions are caught up after each size
-      do_sync();    
+      do_sync();
     }
   }  
 

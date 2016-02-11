@@ -160,7 +160,7 @@ int main(int argc, char **argv) {
   }
 
   if (myrank == 0)
-    printf("%-7s%-9s%-12s%-12s%-12s\n", "Ranks", "Senders", "Bytes", "Sync GET");
+    printf("%-7s%-9s%-12s%-12s\n", "Ranks", "Senders", "Bytes", "Sync GET");
   
   struct timespec time_s, time_e;
   for (int ns = 1; ns < nranks; ns++) {
