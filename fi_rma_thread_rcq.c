@@ -116,7 +116,7 @@ void *wait_remote_completions_thread(void *arg) {
       uint32_t size = (imms & ~(SYNC_CHK))>>32;
       uint32_t iter = imms<<32>>32;
       int n = iter % NRBUFS;
-      uint8_t *v = (uint8_t*)(rbufs[n].addr + size * iter);
+      uint8_t *v = (uint8_t*)(rbufs[n].addr + size * iter/NRBUFS);
       assert(*v == TVAL);
     }
     else if (n && (imms>>32<<32 == SYNC_REQ)) {
@@ -224,14 +224,13 @@ int main(int argc, char **argv) {
 	    // get a remote buffer to write to
 	    int n = next * (NRBUFS+1) + k % NRBUFS;
 	    // compute the offset in the remote buffer for this iter
-	    uintptr_t raddr = rds[n].addr + i * k;
+	    uintptr_t raddr = rds[n].addr + i * k/NRBUFS;
 	    // encode some immediate data so we know where to look on the target
 	    uint64_t imm = SYNC_CHK | (uint64_t)i<<32 | k;
-	    // send a specific value in the first byte
+	    // send a specific value as the first byte
 	    uint8_t *v = (uint8_t*)lbuf.addr;
 	    *v = TVAL;
 
-	    // first part put
 	    pfi_rdma_put(next, lbuf.addr, raddr, i, lbuf.priv_ptr, rds[n].keys.key0,
 			 TAG, imm, TEST_FLAG_WITH_IMM);
 	    
