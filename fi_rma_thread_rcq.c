@@ -34,13 +34,19 @@ static void dbg_wait(void) {
 #define ALLOC_SIZE       (1024*1024*2)
 
 #define NRBUFS           8
+#define TVAL             13
 
-#define BUF_SIZE         (1024*1024*1)
+#define MAX_SIZE         16384
+#define BUF_SIZE         (1024*1024*256UL)
 #define TAG              UINT32_MAX
 #define SQ_SIZE          100
 
 #define LARGE_LIMIT      16384
 #define LARGE_ITERS      1000
+
+#define SYNC_CHK         ((uint64_t)0xff<<56)
+#define SYNC_REQ         ((uint64_t)0xdeadbeef<<32)
+#define SYNC_REP         ((uint64_t)0xcafebabe<<32)
 
 static int ITERS       = 100000;
 
@@ -49,27 +55,28 @@ static int myrank;
 static int nranks;
 static int next;
 static int rthreads = 1;
-static int athreads = 1;
+static int athreads = 0;
 
 static void *ctx;
-static sem_t sem;
+static sem_t sem, rsem;
 
-void *alloc_thread() {
-  test_buf_t bufs[NALLOC];
-  int i = 0;
+test_buf_t lbuf, rbufs[NRBUFS+1], *rds;
+
+int do_sync() {
+  int i, val;
+  for (i=0; i<nranks; i++) {
+    if (i==myrank) continue;
+    sem_wait(&rsem);
+    int n = i * (NRBUFS+1) + NRBUFS;
+    pfi_rdma_put(i, lbuf.addr, rds[n].addr, 8, lbuf.priv_ptr, rds[n].keys.key0,
+		 TAG+1, SYNC_REQ | i, TEST_FLAG_WITH_IMM);
+  }
+  
   do {
-    bufs[i].addr = (uintptr_t)calloc(1, ALLOC_SIZE);
-    bufs[i].size = ALLOC_SIZE;
-    pfi_buffer_register(&bufs[i], ctx, 0);    
-    if (i >= NALLOC/2) {
-      pfi_buffer_unregister(&bufs[i-NALLOC/2], ctx);
-      free((void*)bufs[i-NALLOC/2].addr);
-    }
-    i = (++i) % NALLOC;
-    usleep(1000);
-  } while(!DONE);
+    if (sem_getvalue(&rsem, &val)) continue;
+  } while (val < nranks);
 
-  pthread_exit(NULL);
+  return 0;
 }
 
 void *wait_local_completion_thread(void *arg) {
@@ -85,6 +92,9 @@ void *wait_local_completion_thread(void *arg) {
     if (n && (ids == TAG)) {
       sem_post(&sem);
     }
+    else if (n && (ids == TAG+1)) {
+      // sync completion
+    }
   } while (!DONE);
   
   pthread_exit(NULL);
@@ -93,15 +103,35 @@ void *wait_local_completion_thread(void *arg) {
 void *wait_remote_completions_thread(void *arg) {
   long inputrank = (long)arg;
   uint64_t ids, imms;
-  int n, rc;
+  int i, n, rc;
   
   do {
     rc = pfi_get_revent(TEST_ANY_SOURCE, 1, &ids, &imms, &n);
     if (rc == TEST_EVENT_ERROR) {
       err(1, "Get revent error");
     }
-    if (n) {
-      err(1, "Not expecting a remote event!");
+    
+    if (n && (imms>>56<<56 == SYNC_CHK)) {
+      uint32_t size = (imms & ~(SYNC_CHK))>>32;
+      uint32_t iter = imms<<32>>32;
+      int n = iter % NRBUFS;
+      uint8_t *v = (uint8_t*)rbufs[n].addr + size * iter;
+      assert(*v == TVAL);
+    }
+    else if (n && (imms>>32<<32 == SYNC_REQ)) {
+      for (i=0; i<NRBUFS; i++) {
+	memset((void*)rbufs[i].addr, 0, sizeof(BUF_SIZE));
+      }
+      int src = imms<<32>>32;
+      int n = src * (NRBUFS+1) + NRBUFS;
+      pfi_rdma_put(src, lbuf.addr, rds[n].addr, 8, lbuf.priv_ptr, rds[n].keys.key0,
+		   TAG+1, SYNC_REP | myrank, TEST_FLAG_WITH_IMM);
+    }
+    else if (n && (imms>>32<<32 & SYNC_REQ)) {
+      sem_post(&rsem);
+    }
+    else if (n) {
+      err(1, "Got unexpected immediate data: 0x%016lx", imms);
     }
   } while (!DONE);
   
@@ -113,7 +143,6 @@ int main(int argc, char **argv) {
   int i, j, k, val;
   int rank, nproc, iters;
   pthread_t th, recv_threads[rthreads], th2[athreads];
-  test_buf_t lbuf, rbufs[NRBUFS], *rds;
   
   MPI_Init(&argc,&argv);
 
@@ -136,17 +165,18 @@ int main(int argc, char **argv) {
   lbuf.size = BUF_SIZE;
   pfi_buffer_register(&lbuf, ctx, 0);
   
-  for (i=0; i<NRBUFS; i++) {
-    rbufs[i].addr = (uintptr_t)malloc(BUF_SIZE);
+  for (i=0; i<NRBUFS+1; i++) {
+    rbufs[i].addr = (uintptr_t)calloc(1, BUF_SIZE);
     rbufs[i].size = BUF_SIZE;
     pfi_buffer_register(&rbufs[i], ctx, 0);
   }
-
+  
   rds = malloc(sizeof(rbufs)*nranks);
   MPI_Allgather(&rbufs, sizeof(rbufs), MPI_BYTE, rds, sizeof(rbufs), MPI_BYTE, MPI_COMM_WORLD);
 
   sem_init(&sem, 0, SQ_SIZE);
-
+  sem_init(&rsem, 0, nranks);
+  
   // Create a thread to wait for local completions
   pthread_create(&th, NULL, wait_local_completion_thread, NULL);
 
@@ -154,20 +184,16 @@ int main(int argc, char **argv) {
     pthread_create(&recv_threads[t], NULL, wait_remote_completions_thread, (void*)t);
   }
   
-  // Create some threads that aggressively allocate and register memory
-  for (t=0; t<athreads; t++) {
-    pthread_create(&th2[t], NULL, alloc_thread, NULL);
-  }
-
   if (myrank == 0)
     printf("%-7s%-9s%-12s%-12s%-12s\n", "Ranks", "Senders", "Bytes", "Sync GET");
   
   struct timespec time_s, time_e;
-  for (int ns = 1; ns < nranks; ns++) {
+  for (int ns = 0; ns < nranks; ns++) {
     
-    for (i=1; i<=BUF_SIZE; i+=i) {
+    for (i=1; i<=MAX_SIZE; i+=i) {
       
       iters = (i > LARGE_LIMIT) ? LARGE_ITERS : ITERS;
+      assert(iters*MAX_SIZE <= BUF_SIZE*NRBUFS);
       
       if (myrank == 0) {
 	printf("%-7d", nranks);
@@ -180,13 +206,27 @@ int main(int argc, char **argv) {
 	clock_gettime(CLOCK_MONOTONIC, &time_s);
 	for (k=0; k<iters; k++) {
 	  if (sem_wait(&sem) == 0) {
+	    
 	    int c;
 	    do {
 	      c = pfi_tx_size_left(next);
 	    } while (!c);
-	    int n = next * NRBUFS + k % NRBUFS;
-	    pfi_rdma_get(next, lbuf.addr, rds[n].addr, i, lbuf.priv_ptr, rds[n].keys.key0, TAG, 0);
-	    //pfi_rdma_put(next, lbuf.addr, rds[n].addr, i, lbuf.priv_ptr, rds[n].keys.key0, TAG, 0, 0);
+	    
+	    // get a remote buffer to write to
+	    int n = next * (NRBUFS+1) + k % NRBUFS;
+	    
+	    // compute the offset in the remote buffer for this iter
+	    uintptr_t raddr = rds[n].addr + i * k;
+
+	    // encode some immediate data so we know where to look on the target
+	    uint64_t imm = SYNC_CHK | (uint64_t)i<<32 | k;
+	    
+	    // send a particular value
+	    uint8_t *v = (uint8_t*)lbuf.addr;
+	    *v = TVAL;
+	    
+	    pfi_rdma_put(next, lbuf.addr, raddr, i, lbuf.priv_ptr, rds[n].keys.key0,
+			 TAG, imm, TEST_FLAG_WITH_IMM);
 	  }
 	}
       }
@@ -196,9 +236,7 @@ int main(int argc, char **argv) {
       } while (val < SQ_SIZE);
       
       clock_gettime(CLOCK_MONOTONIC, &time_e);
-      
-      MPI_Barrier(MPI_COMM_WORLD);
-      
+            
       if (myrank == 0) {
 	double time_ns = (double)(((time_e.tv_sec - time_s.tv_sec) * 1e9) + (time_e.tv_nsec - time_s.tv_nsec));
 	double time_us = time_ns/1e3;
@@ -206,6 +244,9 @@ int main(int argc, char **argv) {
 	printf("%-12.2f\n", latency);
 	fflush(stdout);
       }
+      
+      // make sure remote completions are caught up after each size
+      do_sync();    
     }
   }  
 
