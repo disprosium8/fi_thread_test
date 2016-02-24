@@ -34,7 +34,7 @@ static void dbg_wait(void) {
 #define NALLOC           8192
 #define ALLOC_SIZE       (1024*1024*2)
 
-#define NRBUFS           8
+#define NRBUFS           2
 #define TVAL             13
 
 #define MAX_SIZE         16384
@@ -128,7 +128,7 @@ void *wait_remote_completions_thread(void *arg) {
     }
     else if (n && (imms>>32<<32 == SYNC_REQ)) {
       for (i=0; i<NRBUFS+1; i++) {
-	memset((void*)rbufs[i].addr, 0, sizeof(BUF_SIZE));
+	memset((void*)rbufs[i].addr, 0, BUF_SIZE);
       }
       curr = 0;
       // signal that we cleared our local buffers
