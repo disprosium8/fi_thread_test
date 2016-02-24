@@ -1,5 +1,5 @@
 CC      = gcc
-CFLAGS  = $(shell pkg-config ompi,libfabric --cflags) -O3 -g -DENABLE_DEBUG
+CFLAGS  = $(shell pkg-config ompi,libfabric --cflags) -O3 -g -DENABLE_DEBUG -std=gnu99
 LIBS    = $(shell pkg-config ompi,libfabric --libs) -lpthread
 
 all: fi_rma_thread fi_rma_thread_mr fi_rma_thread_rcq

@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <assert.h>
+#include <inttypes.h>
 #include <err.h>
 
 #include "init.h"
@@ -39,7 +40,7 @@ static void dbg_wait(void) {
 #define MAX_SIZE         16384
 #define BUF_SIZE         (1024*1024*256UL)
 #define TAG              UINT32_MAX
-#define SQ_SIZE          100
+#define SQ_SIZE          512
 
 #define LARGE_LIMIT      16384
 #define LARGE_ITERS      1000
@@ -48,7 +49,7 @@ static void dbg_wait(void) {
 #define SYNC_REQ         ((uint64_t)0xdeadbeef<<32)
 #define SYNC_REP         ((uint64_t)0xcafebabe<<32)
 
-static int ITERS       = 100000;
+static int ITERS       = 10000;
 
 static int DONE = 0;
 static int myrank;
@@ -105,6 +106,8 @@ void *wait_remote_completions_thread(void *arg) {
   long inputrank = (long)arg;
   uint64_t ids, imms;
   int i, n, rc;
+
+  static uint32_t curr = 0;
   
   do {
     rc = pfi_get_revent(TEST_ANY_SOURCE, 1, &ids, &imms, &n);
@@ -118,11 +121,16 @@ void *wait_remote_completions_thread(void *arg) {
       int n = iter % NRBUFS;
       uint8_t *v = (uint8_t*)(rbufs[n].addr + size * iter/NRBUFS);
       assert(*v == TVAL);
+      if (iter != curr) {
+	err(1, "Expecting iter %"PRIu32", got %"PRIu32" from RCQ\n", curr, iter);
+      }
+      curr++;
     }
     else if (n && (imms>>32<<32 == SYNC_REQ)) {
       for (i=0; i<NRBUFS+1; i++) {
 	memset((void*)rbufs[i].addr, 0, sizeof(BUF_SIZE));
       }
+      curr = 0;
       // signal that we cleared our local buffers
       sem_post(&rsem);
       
@@ -140,7 +148,7 @@ void *wait_remote_completions_thread(void *arg) {
       // data put
     }
     else if (n) {
-      err(1, "Got unexpected immediate data: 0x%016lx", imms);
+      err(1, "Got unexpected immediate data: %"PRIx64, imms);
     }
   } while (!DONE);
   
@@ -197,9 +205,9 @@ int main(int argc, char **argv) {
     printf("%-7s%-9s%-12s%-12s\n", "Ranks", "Senders", "Bytes", "Sync PUT");
   
   struct timespec time_s, time_e;
-  for (int ns = 0; ns < nranks; ns++) {
+  for (int ns = 1; ns < nranks; ns++) {
     
-    for (i=1; i<=MAX_SIZE; i+=i) {
+    for (i=4096; i<=MAX_SIZE; i+=i) {
       
       iters = (i > LARGE_LIMIT) ? LARGE_ITERS : ITERS;
       assert(iters*MAX_SIZE <= BUF_SIZE*NRBUFS);
